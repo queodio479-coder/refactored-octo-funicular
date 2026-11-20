@@ -4,6 +4,8 @@
 // Dependencias na mesma pasta: imgui (core + backends dx9/win32) e miniaudio.h
 #include <windows.h>
 #include <d3d9.h>
+#include <cstdio>
+#include <cstdarg>
 #include <filesystem>
 #include <string>
 #include <vector>
@@ -28,7 +30,11 @@ struct Config {
     int   toggleKey = VK_F10;
 } cfg;
 
-static bool g_open = false, g_init = false;
+static bool g_open = false, g_init = false, g_audioFailed = false;
+static void Log(const char* fmt, ...) {            // log em SoundSkinPanel/log.txt
+    FILE* f = fopen("SoundSkinPanel/log.txt", "a"); if (!f) return;
+    va_list a; va_start(a, fmt); vfprintf(f, fmt, a); va_end(a); fputc('\n', f); fclose(f);
+}
 static HWND g_hwnd = nullptr;
 static WNDPROC g_oldWndProc = nullptr;
 static ma_engine g_engine;
@@ -70,10 +76,24 @@ static std::string PickFile(const std::string& dir) {
     if (files.empty()) return "";
     return files[rng() % files.size()];
 }
+static ma_context g_ctx;
+static bool EnsureAudio() {                         // so abre o audio quando precisa tocar algo
+    if (g_init) return true;
+    if (g_audioFailed) return false;
+    ma_backend backends[] = { ma_backend_winmm, ma_backend_dsound, ma_backend_wasapi };
+    ma_result r = ma_context_init(backends, 3, nullptr, &g_ctx);
+    if (r == MA_SUCCESS) {
+        ma_engine_config ec = ma_engine_config_init(); ec.pContext = &g_ctx;
+        r = ma_engine_init(&ec, &g_engine);
+    }
+    Log("audio init: %d", (int)r);
+    if (r != MA_SUCCESS) { g_audioFailed = true; return false; }
+    g_init = true; return true;
+}
 static void PlayFrom(const std::string& dir, float vol) {
-    if (!g_init) return;
     std::string f = PickFile(dir);
     if (f.empty()) return;
+    if (!EnsureAudio()) return;
     // ma_engine_play_sound nao tem volume por som; usa grupo implicito: ajusta via sound
     static std::vector<ma_sound*> live;
     for (size_t i = 0; i < live.size();) {            // limpa sons terminados
@@ -258,8 +278,6 @@ static void TrackChat(WPARAM w) {
 
 static LRESULT CALLBACK WndProcHook(HWND h, UINT m, WPARAM w, LPARAM l) {
     // Alt+J (Alt gera WM_SYSKEYDOWN) e tecla F10
-    if ((m == WM_SYSKEYDOWN || m == WM_KEYDOWN) && w == 'J' && (GetKeyState(VK_MENU) & 0x8000)) { TogglePanel(); return 0; }
-    if ((m == WM_SYSKEYDOWN || m == WM_KEYDOWN) && w == (WPARAM)cfg.toggleKey) { TogglePanel(); return 0; }
     if (m == WM_SYSCHAR && (w == 'j' || w == 'J')) return 0;   // evita beep do Alt+J
     // comando /bdm: so acompanha quando o painel nao esta digitando
     if (g_imguiReady && !ImGui::GetIO().WantTextInput) {
@@ -283,6 +301,16 @@ static HRESULT WINAPI hkEndScene(IDirect3DDevice9* dev) {
         ImGui_ImplWin32_Init(g_hwnd); ImGui_ImplDX9_Init(dev);
         g_oldWndProc = (WNDPROC)SetWindowLongPtrA(g_hwnd, GWLP_WNDPROC, (LONG_PTR)WndProcHook);
         g_imguiReady = true;
+        Log("imgui pronto, hwnd=%p", (void*)g_hwnd);
+    }
+    {   // Alt+J e F10 por leitura direta do teclado
+        static bool pj = false, pf = false; static int frames = 0;
+        if (++frames == 1) Log("EndScene rodando");
+        bool focus = GetForegroundWindow() == g_hwnd;
+        bool j = focus && (GetAsyncKeyState(VK_MENU) & 0x8000) && (GetAsyncKeyState('J') & 0x8000);
+        bool f = focus && (GetAsyncKeyState(cfg.toggleKey) & 0x8000);
+        if ((j && !pj) || (f && !pf)) { TogglePanel(); Log("painel %s", g_open ? "aberto" : "fechado"); }
+        pj = j; pf = f;
     }
     GameTick();
     if (g_open) {
@@ -307,12 +335,17 @@ static void PatchVTable() {
     D3DPRESENT_PARAMETERS pp{}; pp.Windowed = TRUE; pp.SwapEffect = D3DSWAPEFFECT_DISCARD; pp.hDeviceWindow = hw;
     pp.BackBufferFormat = D3DFMT_UNKNOWN;
     IDirect3DDevice9* dev = nullptr;
-    if (d3d && SUCCEEDED(d3d->CreateDevice(D3DADAPTER_DEFAULT, D3DDEVTYPE_NULLREF, hw,
-                         D3DCREATE_SOFTWARE_VERTEXPROCESSING, &pp, &dev))) {
+    HRESULT hr = d3d ? d3d->CreateDevice(D3DADAPTER_DEFAULT, D3DDEVTYPE_NULLREF, hw,
+                         D3DCREATE_SOFTWARE_VERTEXPROCESSING, &pp, &dev) : E_FAIL;
+    if (FAILED(hr) && d3d) hr = d3d->CreateDevice(D3DADAPTER_DEFAULT, D3DDEVTYPE_HAL, hw,
+                         D3DCREATE_SOFTWARE_VERTEXPROCESSING, &pp, &dev);
+    Log("dummy device hr=0x%08lX", (unsigned long)hr);
+    if (SUCCEEDED(hr) && dev) {
         void** vt = *(void***)dev;                    // vtable compartilhada com o device do jogo
         DWORD old; VirtualProtect(&vt[16], 4*27, PAGE_READWRITE, &old);
         oReset = (Reset_t)vt[16]; oEndScene = (EndScene_t)vt[42];
         vt[16] = hkReset; vt[42] = hkEndScene;
+        Log("vtable patch ok");
         VirtualProtect(&vt[16], 4*27, old, &old);
         dev->Release();
     }
@@ -321,10 +354,11 @@ static void PatchVTable() {
 }
 
 static DWORD WINAPI MainThread(LPVOID) {
-    while (!GetModuleHandleA("samp.dll")) Sleep(500);   // espera o SA-MP (qualquer versao)
-    Sleep(1500);
     CreateFolders(); LoadConfig();
-    ma_engine_init(nullptr, &g_engine); g_init = true;
+    Log("---- plugin carregado ----");
+    while (!GetModuleHandleA("samp.dll")) Sleep(500);   // espera o SA-MP (qualquer versao)
+    Log("samp.dll encontrado");
+    Sleep(1500);
     PatchVTable();
     return 0;
 }
