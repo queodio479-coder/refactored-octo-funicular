@@ -327,6 +327,32 @@ static HRESULT WINAPI hkReset(IDirect3DDevice9* dev, D3DPRESENT_PARAMETERS* pp) 
     return r;
 }
 
+static void InstallHooks(void** vt) {
+    HMODULE m = nullptr; char name[MAX_PATH] = "?";
+    if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCSTR)vt[42], &m))
+        GetModuleFileNameA(m, name, MAX_PATH);
+    Log("vtable=%p EndScene=%p (%s)", (void*)vt, vt[42], name);
+    DWORD old; VirtualProtect(&vt[16], 4 * 27, PAGE_READWRITE, &old);
+    oReset = (Reset_t)vt[16]; oEndScene = (EndScene_t)vt[42];
+    vt[16] = (void*)hkReset; vt[42] = (void*)hkEndScene;
+    VirtualProtect(&vt[16], 4 * 27, old, &old);
+    Log("vtable patch ok");
+}
+
+// Device D3D9 que o proprio GTA SA usa (RwD3DDevice, GTA SA 1.0 US)
+static bool PatchGameDevice() {
+    for (int i = 0; i < 300; i++) {                 // espera ate ~30 s
+        IDirect3DDevice9* dev = *(IDirect3DDevice9**)0xC97C28;
+        if (dev && !IsBadReadPtr(dev, 4)) {
+            void** vt = *(void***)dev;
+            if (vt && !IsBadReadPtr(vt, 4 * 43)) { Log("device do jogo=%p", (void*)dev); InstallHooks(vt); return true; }
+        }
+        Sleep(100);
+    }
+    Log("device do jogo nao encontrado");
+    return false;
+}
+
 static void PatchVTable() {
     WNDCLASSA wc{}; wc.lpfnWndProc = DefWindowProcA; wc.hInstance = GetModuleHandleA(0); wc.lpszClassName = "ssp_dummy";
     RegisterClassA(&wc);
@@ -341,12 +367,7 @@ static void PatchVTable() {
                          D3DCREATE_SOFTWARE_VERTEXPROCESSING, &pp, &dev);
     Log("dummy device hr=0x%08lX", (unsigned long)hr);
     if (SUCCEEDED(hr) && dev) {
-        void** vt = *(void***)dev;                    // vtable compartilhada com o device do jogo
-        DWORD old; VirtualProtect(&vt[16], 4*27, PAGE_READWRITE, &old);
-        oReset = (Reset_t)vt[16]; oEndScene = (EndScene_t)vt[42];
-        vt[16] = hkReset; vt[42] = hkEndScene;
-        Log("vtable patch ok");
-        VirtualProtect(&vt[16], 4*27, old, &old);
+        InstallHooks(*(void***)dev);                  // plano B: vtable do device de teste
         dev->Release();
     }
     if (d3d) d3d->Release();
@@ -354,12 +375,17 @@ static void PatchVTable() {
 }
 
 static DWORD WINAPI MainThread(LPVOID) {
+    {   // garante que caminhos relativos apontam para a pasta do gta_sa.exe
+        char exe[MAX_PATH]; GetModuleFileNameA(nullptr, exe, MAX_PATH);
+        std::string d = exe; size_t k = d.find_last_of("\\/");
+        if (k != std::string::npos) SetCurrentDirectoryA(d.substr(0, k).c_str());
+    }
     CreateFolders(); LoadConfig();
     Log("---- plugin carregado ----");
     while (!GetModuleHandleA("samp.dll")) Sleep(500);   // espera o SA-MP (qualquer versao)
     Log("samp.dll encontrado");
     Sleep(1500);
-    PatchVTable();
+    if (!PatchGameDevice()) PatchVTable();
     return 0;
 }
 
